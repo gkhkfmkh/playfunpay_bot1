@@ -105,8 +105,8 @@ DEFAULT_BUTTONS: dict[str, str] = {
     "daily": "💰 Способы заработка",
     "games": "🎮 Игры и гайды",
     "referral": "👥 Реферальная система",
-    "promo": "🎟 Ввести промокод",
-    "support": "🆘 Поддержка",
+    "promo": "🎟 Промокод",
+    "support": "🆘 Помощь",
     "payments": "💳 Способы оплаты",
     "back": "⬅️ Назад в меню",
     "roblox": "🤖 Roblox",
@@ -335,7 +335,9 @@ def back_markup() -> InlineKeyboardMarkup:
 
 
 async def main_markup() -> InlineKeyboardMarkup:
-    keys = ["channel", "ads", "about", "buy"]
+    # Основные действия пользователя. Промокод и помощь вынесены
+    # непосредственно в главное меню, чтобы их не приходилось искать.
+    keys = ["channel", "ads", "about", "buy", "promo", "support"]
     rows: list[list[InlineKeyboardButton]] = []
     for key in keys:
         title = await get_button_title(key)
