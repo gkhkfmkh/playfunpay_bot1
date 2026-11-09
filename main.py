@@ -107,6 +107,7 @@ DEFAULT_BUTTONS: dict[str, str] = {
     "referral": "👥 Реферальная система",
     "promo": "🎟 Промокод",
     "support": "🆘 Помощь",
+    "raffle": "🎁 Розыгрыш",
     "payments": "💳 Способы оплаты",
     "back": "⬅️ Назад в меню",
     "roblox": "🤖 Roblox",
@@ -194,6 +195,7 @@ DEFAULT_TEXTS: dict[str, str] = {
 
 DEFAULT_SETTINGS: dict[str, str] = {
     "channel_url": "",
+    "channel_chat_id": "",
     "ads_url": "",
     "payment_details": (
         "Перевод на карту / СБП.\n"
@@ -337,7 +339,7 @@ def back_markup() -> InlineKeyboardMarkup:
 async def main_markup() -> InlineKeyboardMarkup:
     # Основные действия пользователя. Промокод и помощь вынесены
     # непосредственно в главное меню, чтобы их не приходилось искать.
-    keys = ["channel", "ads", "about", "buy", "promo", "support"]
+    keys = ["channel", "ads", "about", "buy", "raffle", "promo", "support"]
     rows: list[list[InlineKeyboardButton]] = []
     for key in keys:
         title = await get_button_title(key)
@@ -376,6 +378,8 @@ async def admin_markup() -> InlineKeyboardMarkup:
         [button("💰 Тарифы и цены", "admin:tariffs"), button("💳 Реквизиты", "admin:payment")],
         [button("📚 Публикации", "admin:posts"), button("🎟 Промокоды", "admin:promos")],
         [button("📢 Рассылка", "admin:broadcast"), button("🆘 Поддержка", "admin:support")],
+        [button("🎁 Розыгрыши", "admin:raffles"), button("📣 Пост в канал", "admin:channel_post")],
+        [button("📈 Статистика розыгрышей", "admin:raffle_stats")],
         [button("⚙️ Настройки", "admin:settings")],
         [button("🏠 Пользовательское меню", "nav:home")],
     ]
@@ -493,6 +497,37 @@ async def init_database() -> None:
             CREATE INDEX IF NOT EXISTS idx_users_referrer ON users(referrer);
             CREATE INDEX IF NOT EXISTS idx_payments_status ON payment_requests(status);
             CREATE INDEX IF NOT EXISTS idx_support_status ON support_messages(status);
+
+            CREATE TABLE IF NOT EXISTS raffles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                prize TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                channel_id TEXT NOT NULL,
+                channel_url TEXT NOT NULL DEFAULT '',
+                ends_at TEXT NOT NULL,
+                winners_count INTEGER NOT NULL DEFAULT 1 CHECK(winners_count > 0),
+                status TEXT NOT NULL DEFAULT 'active',
+                created_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                finished_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS raffle_participants (
+                raffle_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                joined_at TEXT NOT NULL,
+                PRIMARY KEY(raffle_id,user_id)
+            );
+            CREATE TABLE IF NOT EXISTS raffle_winners (
+                raffle_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                place INTEGER NOT NULL,
+                selected_at TEXT NOT NULL,
+                PRIMARY KEY(raffle_id,place),
+                UNIQUE(raffle_id,user_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_raffles_status_end ON raffles(status,ends_at);
+            CREATE INDEX IF NOT EXISTS idx_raffle_participants_user ON raffle_participants(user_id);
             """
         )
 
@@ -876,6 +911,10 @@ async def handle_media(message: Message) -> None:
     if not state:
         return
     user_id = message.from_user.id
+
+    if is_admin(user_id) and state.get("state") in {"admin_broadcast_message", "admin_channel_message"}:
+        await process_admin_content_message(message, state)
+        return
 
     if state["state"] == "waiting_receipt":
         file_id = message.photo[-1].file_id if message.photo else message.document.file_id
@@ -1616,6 +1655,7 @@ async def admin_settings(call: CallbackQuery) -> None:
         return
     rows = [
         [button("🔗 Ссылка на канал", "admin:setting:channel_url")],
+        [button("🆔 ID канала для публикаций", "admin:setting:channel_chat_id")],
         [button("💎 Ссылка рекламы", "admin:setting:ads_url")],
         [button("🆘 Доп. текст поддержки", "admin:setting:support_text")],
         [button("🏷 Название проекта", "admin:setting:project_name")],
@@ -1632,7 +1672,7 @@ async def admin_setting_edit(call: CallbackQuery) -> None:
         await call.answer("Нет доступа", show_alert=True)
         return
     key = call.data.split(":", 2)[2]
-    allowed = {"payment_details", "currency", "channel_url", "ads_url", "support_text", "project_name"}
+    allowed = {"payment_details", "currency", "channel_url", "channel_chat_id", "ads_url", "support_text", "project_name"}
     if key not in allowed:
         await call.answer("Настройка не найдена", show_alert=True)
         return
@@ -1809,11 +1849,10 @@ async def admin_broadcast(call: CallbackQuery) -> None:
     if not is_admin(call.from_user.id):
         await call.answer("Нет доступа", show_alert=True)
         return
-    set_state(call.from_user.id, "admin_broadcast")
+    set_state(call.from_user.id, "admin_broadcast_message")
     await call.message.answer(
-        "📢 Отправь текст рассылки.\n"
-        "Сообщение будет отправлено всем незаблокированным пользователям.\n"
-        "Для отмены отправь /cancel."
+        "📢 Отправь сообщение для рассылки. Можно текст, фото или документ с подписью.\n"
+        "Бот скопирует его всем незаблокированным пользователям. Для отмены: /cancel."
     )
     await call.answer()
 
@@ -1877,6 +1916,693 @@ async def main() -> None:
         )
     finally:
         await bot.session.close()
+
+
+
+# =============================================================================
+# PLAYFUNPAY EXTENSIONS: RAFFLES, CHANNEL POSTS AND RICH BROADCASTS
+# =============================================================================
+
+def _raffle_date(value: str) -> str:
+    parsed = parse_db_datetime(value)
+    return parsed.strftime("%d.%m.%Y %H:%M UTC") if parsed else "—"
+
+
+def _member_status_is_valid(member: Any) -> bool:
+    status = getattr(member, "status", "")
+    status = getattr(status, "value", status)
+    return status in {"creator", "administrator", "member"} or (
+        status == "restricted" and bool(getattr(member, "is_member", False))
+    )
+
+
+async def _check_channel_subscription(user_id: int, channel_id: str) -> Optional[bool]:
+    try:
+        member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+        return _member_status_is_valid(member)
+    except (TelegramBadRequest, TelegramForbiddenError):
+        logger.exception("Subscription check failed for channel %s", channel_id)
+        return None
+    except Exception:
+        logger.exception("Unexpected subscription check failure")
+        return None
+
+
+async def _raffle_card(message: Message, raffle_id: int) -> None:
+    row = await db_fetchone(
+        "SELECT title,prize,description,channel_id,channel_url,ends_at,winners_count,status "
+        "FROM raffles WHERE id=?", (raffle_id,)
+    )
+    if not row:
+        await message.answer("Розыгрыш не найден.", reply_markup=await main_markup())
+        return
+    title, prize, description, channel_id, channel_url, ends_at, winners_count, status = row
+    count = (await db_fetchone(
+        "SELECT COUNT(*) FROM raffle_participants WHERE raffle_id=?", (raffle_id,)
+    ))[0]
+    deadline = parse_db_datetime(ends_at)
+    if status != "active" or not deadline or deadline <= now_local():
+        await message.answer(
+            f"🎁 <b>{safe_html(title)}</b>\nПриз: <b>{safe_html(prize)}</b>\n"
+            f"Статус: <b>приём заявок завершён</b>\nУчастников: <b>{count}</b>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [button("⬅️ К розыгрышам", "menu:raffle")],
+                [button("🏠 Главное меню", "nav:home")],
+            ]),
+        )
+        return
+    text = (
+        f"🎁 <b>{safe_html(title)}</b>\n\n"
+        f"🏆 Приз: <b>{safe_html(prize)}</b>\n"
+        f"👥 Участников: <b>{count}</b>\n"
+        f"🏅 Победителей: <b>{winners_count}</b>\n"
+        f"⏰ Окончание: <b>{_raffle_date(ends_at)}</b>\n\n"
+        f"<b>Условия:</b>\n{safe_html(description)}\n\n"
+        "Подпишись на канал и нажми «Проверить подписку и участвовать». "
+        "Бот проверит подписку перед регистрацией."
+    )
+    rows = []
+    if channel_url:
+        rows.append([url_button("📢 Подписаться на канал", channel_url)])
+    rows.extend([
+        [button("🔍 Проверить подписку и участвовать", f"raffle:join:{raffle_id}")],
+        [button("⬅️ К розыгрышам", "menu:raffle")],
+        [button("🏠 Главное меню", "nav:home")],
+    ])
+    await message.answer(
+        truncate(text),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.callback_query(F.data == "menu:raffle")
+async def menu_raffle(call: CallbackQuery) -> None:
+    if await is_banned(call.from_user.id):
+        await call.answer("Доступ ограничен", show_alert=True)
+        return
+    rows = await db_fetchall(
+        "SELECT id,title,prize,ends_at FROM raffles "
+        "WHERE status='active' AND ends_at>? ORDER BY ends_at LIMIT 10",
+        (dt_to_db(now_local()),)
+    )
+    if not rows:
+        await call.message.answer(
+            "🎁 <b>Розыгрыши PlayFunpay</b>\n\nСейчас активных розыгрышей нет. Загляни позже!",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [button("🏆 Итоги прошлых розыгрышей", "raffle:history")],
+                [button("⬅️ Назад в меню", "nav:home")]
+            ])
+        )
+        await call.answer()
+        return
+    lines = ["🎁 <b>Активные розыгрыши</b>\n"]
+    keyboard = []
+    for raffle_id, title, prize, ends_at in rows:
+        lines.append(
+            f"🎯 <b>{safe_html(title)}</b>\n"
+            f"Приз: {safe_html(prize)} · до {_raffle_date(ends_at)}"
+        )
+        keyboard.append([button(f"🎁 {title[:40]}", f"raffle:view:{raffle_id}")])
+    keyboard.append([button("🏆 Итоги прошлых розыгрышей", "raffle:history")])
+    keyboard.append([button("⬅️ Назад в меню", "nav:home")])
+    await call.message.answer(
+        truncate("\n\n".join(lines)),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("raffle:view:"))
+async def raffle_view(call: CallbackQuery) -> None:
+    try:
+        raffle_id = int(call.data.rsplit(":", 1)[1])
+    except ValueError:
+        await call.answer("Некорректный розыгрыш", show_alert=True)
+        return
+    await _raffle_card(call.message, raffle_id)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("raffle:join:"))
+async def raffle_join(call: CallbackQuery) -> None:
+    try:
+        raffle_id = int(call.data.rsplit(":", 1)[1])
+    except ValueError:
+        await call.answer("Некорректный розыгрыш", show_alert=True)
+        return
+    user_id = call.from_user.id
+    if await is_banned(user_id):
+        await call.answer("Доступ ограничен", show_alert=True)
+        return
+    raffle = await db_fetchone(
+        "SELECT title,channel_id,ends_at,status FROM raffles WHERE id=?", (raffle_id,)
+    )
+    if not raffle:
+        await call.answer("Розыгрыш не найден", show_alert=True)
+        return
+    title, channel_id, ends_at, status = raffle
+    deadline = parse_db_datetime(ends_at)
+    if status != "active" or not deadline or deadline <= now_local():
+        await call.answer("Приём заявок завершён", show_alert=True)
+        return
+    subscribed = await _check_channel_subscription(user_id, str(channel_id))
+    if subscribed is None:
+        await call.answer(
+            "Не удалось проверить подписку. Проверьте, что бот — администратор канала.",
+            show_alert=True
+        )
+        return
+    if not subscribed:
+        await call.answer("Сначала подпишись на канал, затем проверь подписку ещё раз.", show_alert=True)
+        return
+    existing_entry = await db_fetchone(
+        "SELECT 1 FROM raffle_participants WHERE raffle_id=? AND user_id=?",
+        (raffle_id, user_id)
+    )
+    if existing_entry:
+        await call.answer("Ты уже участвуешь в этом розыгрыше.", show_alert=True)
+        return
+    await db_execute(
+        "INSERT OR IGNORE INTO raffle_participants(raffle_id,user_id,joined_at) VALUES(?,?,?)",
+        (raffle_id, user_id, dt_to_db(now_local()))
+    )
+    count = (await db_fetchone(
+        "SELECT COUNT(*) FROM raffle_participants WHERE raffle_id=?", (raffle_id,)
+    ))[0]
+    await call.answer("✅ Участие подтверждено!", show_alert=True)
+    try:
+        await call.message.edit_text(
+            f"🎉 <b>Ты участвуешь!</b>\n\n{safe_html(title)}\n"
+            f"Твоё участие сохранено.\nУчастников: <b>{count}</b>\n\n"
+            "Оставайся подписанным на канал до подведения итогов.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [button("🎁 Другие розыгрыши", "menu:raffle")],
+                [button("🏠 Главное меню", "nav:home")]
+            ])
+        )
+    except TelegramBadRequest:
+        pass
+
+
+
+@dp.callback_query(F.data == "raffle:history")
+async def raffle_history(call: CallbackQuery) -> None:
+    finished = await db_fetchall(
+        """
+        SELECT r.id,r.title,r.prize,r.finished_at,
+               w.place,w.user_id,u.username,u.first_name
+        FROM raffles r
+        LEFT JOIN raffle_winners w ON w.raffle_id=r.id
+        LEFT JOIN users u ON u.user_id=w.user_id
+        WHERE r.status='finished'
+        ORDER BY r.finished_at DESC,r.id DESC,w.place ASC
+        LIMIT 40
+        """
+    )
+    if not finished:
+        text = "🏆 <b>Итоги розыгрышей</b>\n\nЗавершённых розыгрышей пока нет."
+    else:
+        groups = {}
+        for rid, title, prize, finished_at, place, user_id, username, first_name in finished:
+            if rid not in groups:
+                groups[rid] = {
+                    "title": title, "prize": prize, "finished": finished_at, "winners": []
+                }
+            if user_id is not None:
+                label = f"@{username}" if username else (first_name or f"ID {user_id}")
+                groups[rid]["winners"].append(f"{place}. {safe_html(label)}")
+        lines = ["🏆 <b>Итоги прошлых розыгрышей</b>\n"]
+        for rid, item in groups.items():
+            finished_label = _raffle_date(item["finished"]) if item["finished"] else "—"
+            lines.append(
+                f"🎁 <b>#{rid} {safe_html(item['title'])}</b>\n"
+                f"Приз: {safe_html(item['prize'])}\n"
+                f"Дата итогов: {finished_label}\n"
+                + ("\n".join(item["winners"]) if item["winners"] else "Победителей нет.")
+            )
+        text = "\n\n".join(lines)
+    await call.message.answer(
+        truncate(text),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [button("🎁 К активным розыгрышам", "menu:raffle")],
+            [button("⬅️ В главное меню", "nav:home")]
+        ])
+    )
+    await call.answer()
+
+
+# ------------------------------ Admin panel ----------------------------------
+
+@dp.callback_query(F.data == "admin:raffles")
+async def admin_raffles(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    data = await db_fetchall(
+        "SELECT r.id,r.title,r.prize,r.ends_at,r.status,"
+        "(SELECT COUNT(*) FROM raffle_participants p WHERE p.raffle_id=r.id) "
+        "FROM raffles r ORDER BY r.id DESC LIMIT 12"
+    )
+    lines = ["🎁 <b>Управление розыгрышами</b>\n"]
+    keyboard = [[button("➕ Создать розыгрыш", "admin:raffle:create")]]
+    for rid, title, prize, ends, status, count in data:
+        lines.append(
+            f"#{rid} <b>{safe_html(title)}</b> · {safe_html(status)}\n"
+            f"Приз: {safe_html(prize)} · участников: {count}\n"
+            f"Окончание: {_raffle_date(ends)}"
+        )
+        keyboard.append([button(f"⚙️ #{rid} {title[:35]}", f"admin:raffle:view:{rid}")])
+    if not data:
+        lines.append("Розыгрышей пока нет.")
+    keyboard.append([button("⬅️ В админку", "admin:home")])
+    await call.message.answer(
+        truncate("\n\n".join(lines)),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "admin:raffle:create")
+async def admin_raffle_create(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    set_state(call.from_user.id, "raffle_title")
+    await call.message.answer(
+        "🎁 <b>Создание розыгрыша · шаг 1/7</b>\n"
+        "Отправь название розыгрыша. Для отмены — /cancel."
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("admin:raffle:view:"))
+async def admin_raffle_view(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        rid = int(call.data.rsplit(":", 1)[1])
+    except ValueError:
+        await call.answer("Некорректный ID", show_alert=True)
+        return
+    row = await db_fetchone(
+        "SELECT title,prize,description,channel_id,ends_at,winners_count,status "
+        "FROM raffles WHERE id=?", (rid,)
+    )
+    if not row:
+        await call.answer("Розыгрыш не найден", show_alert=True)
+        return
+    title, prize, description, channel, ends, count_winners, status = row
+    participants = (await db_fetchone(
+        "SELECT COUNT(*) FROM raffle_participants WHERE raffle_id=?", (rid,)
+    ))[0]
+    winners = await db_fetchall(
+        "SELECT user_id,place FROM raffle_winners WHERE raffle_id=? ORDER BY place", (rid,)
+    )
+    lines = [
+        f"🎁 <b>Розыгрыш #{rid}</b>",
+        f"Название: {safe_html(title)}",
+        f"Приз: {safe_html(prize)}",
+        f"Описание: {safe_html(description)}",
+        f"Канал: <code>{safe_html(channel)}</code>",
+        f"Участников: <b>{participants}</b>",
+        f"Победителей: <b>{count_winners}</b>",
+        f"Окончание: {_raffle_date(ends)}",
+        f"Статус: <b>{safe_html(status)}</b>",
+    ]
+    if winners:
+        lines.append("\n🏆 <b>Победители:</b>")
+        lines.extend(f"{place}. <code>{uid}</code>" for uid, place in winners)
+    keyboard = []
+    deadline = parse_db_datetime(ends)
+    if status == "active" and deadline and deadline <= now_local():
+        keyboard.append([button("🏆 Завершить и выбрать победителей", f"admin:raffle:draw:{rid}")])
+    keyboard.extend([
+        [button("⬅️ К розыгрышам", "admin:raffles")],
+        [button("⬅️ В админку", "admin:home")]
+    ])
+    await call.message.answer(
+        truncate("\n".join(lines)),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("admin:raffle:draw:"))
+async def admin_raffle_draw(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        rid = int(call.data.rsplit(":", 1)[1])
+    except ValueError:
+        await call.answer("Некорректный ID", show_alert=True)
+        return
+    row = await db_fetchone(
+        "SELECT title,prize,channel_id,ends_at,winners_count,status FROM raffles WHERE id=?",
+        (rid,)
+    )
+    if not row:
+        await call.answer("Розыгрыш не найден", show_alert=True)
+        return
+    title, prize, channel, ends, winner_count, status = row
+    deadline = parse_db_datetime(ends)
+    if status != "active":
+        await call.answer("Розыгрыш уже завершён", show_alert=True)
+        return
+    if not deadline or deadline > now_local():
+        await call.answer("Срок розыгрыша ещё не закончился", show_alert=True)
+        return
+
+    entries = await db_fetchall(
+        "SELECT user_id FROM raffle_participants WHERE raffle_id=? ORDER BY joined_at", (rid,)
+    )
+    eligible = []
+    for (uid,) in entries:
+        membership = await _check_channel_subscription(int(uid), str(channel))
+        if membership is None:
+            await call.answer(
+                "Не удалось проверить участников. Проверь права бота в канале и повтори.",
+                show_alert=True
+            )
+            return
+        if membership:
+            eligible.append(int(uid))
+        await asyncio.sleep(0.05)
+
+    import secrets
+    selected = secrets.SystemRandom().sample(
+        eligible, min(int(winner_count), len(eligible))
+    ) if eligible else []
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute("SELECT status FROM raffles WHERE id=?", (rid,))
+        current = await cur.fetchone()
+        if not current or current[0] != "active":
+            await db.rollback()
+            await call.answer("Розыгрыш уже обработан", show_alert=True)
+            return
+        await db.execute(
+            "UPDATE raffles SET status='finished',finished_at=? WHERE id=? AND status='active'",
+            (dt_to_db(now_local()), rid)
+        )
+        for place, uid in enumerate(selected, 1):
+            await db.execute(
+                "INSERT INTO raffle_winners(raffle_id,user_id,place,selected_at) VALUES(?,?,?,?)",
+                (rid, uid, place, dt_to_db(now_local()))
+            )
+        await db.commit()
+
+    await audit(call.from_user.id, "raffle_finished",
+                f"raffle={rid}; eligible={len(eligible)}; winners={selected}")
+    if selected:
+        for place, uid in enumerate(selected, 1):
+            await send_user(
+                uid,
+                f"🏆 <b>Поздравляем! Ты победитель розыгрыша PlayFunpay!</b>\n\n"
+                f"Розыгрыш: <b>{safe_html(title)}</b>\nПриз: <b>{safe_html(prize)}</b>\n"
+                f"Место: <b>{place}</b>\nСвяжись с администрацией для получения приза."
+            )
+        result = (
+            f"🏆 <b>Итоги розыгрыша #{rid}</b>\n{safe_html(title)} — {safe_html(prize)}\n\n"
+            + "\n".join(f"{i}. <code>{uid}</code>" for i, uid in enumerate(selected, 1))
+        )
+    else:
+        result = f"Розыгрыш <b>{safe_html(title)}</b> завершён. Подходящих участников нет."
+    await call.message.answer(
+        result,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [button("🎁 Все розыгрыши", "admin:raffles")],
+            [button("⬅️ В админку", "admin:home")]
+        ])
+    )
+    try:
+        await bot.send_message(channel, result)
+    except Exception:
+        logger.exception("Could not publish raffle result to %s", channel)
+    await call.answer("Розыгрыш завершён")
+
+
+# -------------------------- Raffle creation wizard ---------------------------
+
+async def _handle_raffle_wizard(message: Message, state: dict[str, Any], text: str) -> bool:
+    uid = message.from_user.id
+    kind = state.get("state")
+    value = text.strip()
+
+    if kind == "raffle_title":
+        if not 3 <= len(value) <= 100:
+            await message.answer("Название должно быть длиной 3–100 символов.")
+            return True
+        set_state(uid, "raffle_prize", title=value)
+        await message.answer("Шаг 2/7. Какой приз разыгрываем?")
+        return True
+
+    if kind == "raffle_prize":
+        if not 1 <= len(value) <= 200:
+            await message.answer("Приз должен быть длиной до 200 символов.")
+            return True
+        set_state(uid, "raffle_description", title=state["title"], prize=value)
+        await message.answer("Шаг 3/7. Напиши условия розыгрыша.")
+        return True
+
+    if kind == "raffle_description":
+        if not 1 <= len(value) <= 1200:
+            await message.answer("Описание должно быть длиной 1–1200 символов.")
+            return True
+        set_state(uid, "raffle_channel", title=state["title"], prize=state["prize"], description=value)
+        await message.answer(
+            "Шаг 4/7. Укажи @username канала или его ID вида -1001234567890.\n"
+            "Бот должен быть администратором этого канала."
+        )
+        return True
+
+    if kind == "raffle_channel":
+        if not re.fullmatch(r"@[A-Za-z0-9_]{5,}|-100\d{5,}", value):
+            await message.answer("Укажи корректный @username или ID канала вида -1001234567890.")
+            return True
+        try:
+            bot_user = await bot.get_me()
+            bot_member = await bot.get_chat_member(chat_id=value, user_id=bot_user.id)
+            member_status = getattr(bot_member.status, "value", bot_member.status)
+            if member_status not in {"administrator", "creator"}:
+                await message.answer("Бот должен быть администратором выбранного канала.")
+                return True
+        except Exception:
+            logger.exception("Cannot validate raffle channel %s", value)
+            await message.answer(
+                "Не удалось проверить канал. Убедись, что канал указан верно и бот добавлен туда администратором."
+            )
+            return True
+        set_state(uid, "raffle_invite", title=state["title"], prize=state["prize"],
+                  description=state["description"], channel_id=value)
+        await message.answer(
+            "Шаг 5/7. Отправь ссылку для подписки: https://t.me/...\n"
+            "Если ссылка уже указана в настройках бота, отправь дефис: <code>-</code>."
+        )
+        return True
+
+    if kind == "raffle_invite":
+        if value == "-":
+            invite = await get_setting("channel_url", "")
+            if not invite and str(state["channel_id"]).startswith("@"):
+                invite = "https://t.me/" + str(state["channel_id"])[1:]
+        elif value.startswith("https://t.me/"):
+            invite = value
+        else:
+            await message.answer("Нужна ссылка https://t.me/... или дефис.")
+            return True
+        if not invite:
+            await message.answer("Ссылка на вступление обязательна. Отправь https://t.me/... .")
+            return True
+        set_state(uid, "raffle_deadline", title=state["title"], prize=state["prize"],
+                  description=state["description"], channel_id=state["channel_id"],
+                  channel_url=invite)
+        await message.answer(
+            "Шаг 6/7. Укажи окончание по UTC в формате <code>ГГГГ-ММ-ДД ЧЧ:ММ</code>.\n"
+            "Пример: <code>2026-12-01 20:00</code>."
+        )
+        return True
+
+    if kind == "raffle_deadline":
+        try:
+            deadline = datetime.strptime(value, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+        except ValueError:
+            await message.answer("Неверный формат даты. Пример: <code>2026-12-01 20:00</code>.")
+            return True
+        if deadline <= now_local() + timedelta(minutes=2):
+            await message.answer("Дата должна быть минимум на 2 минуты в будущем.")
+            return True
+        set_state(uid, "raffle_winners_count", title=state["title"], prize=state["prize"],
+                  description=state["description"], channel_id=state["channel_id"],
+                  channel_url=state["channel_url"], ends_at=dt_to_db(deadline))
+        await message.answer("Шаг 7/7. Сколько победителей выбрать? Введи число от 1 до 20.")
+        return True
+
+    if kind == "raffle_winners_count":
+        try:
+            winners_count = int(value)
+            if not 1 <= winners_count <= 20:
+                raise ValueError
+        except ValueError:
+            await message.answer("Количество победителей должно быть от 1 до 20.")
+            return True
+
+        rid = await db_execute(
+            "INSERT INTO raffles(title,prize,description,channel_id,channel_url,ends_at,"
+            "winners_count,status,created_by,created_at) VALUES(?,?,?,?,?,?,?,'active',?,?)",
+            (state["title"], state["prize"], state["description"], state["channel_id"],
+             state["channel_url"], state["ends_at"], winners_count, uid, dt_to_db(now_local()))
+        )
+        clear_state(uid)
+        await audit(uid, "raffle_created", f"raffle={rid}; title={state['title']}")
+        announcement = (
+            f"🎁 <b>НОВЫЙ РОЗЫГРЫШ PLAYFUNPAY</b>\n\n"
+            f"🎯 {safe_html(state['title'])}\n🏆 Приз: <b>{safe_html(state['prize'])}</b>\n"
+            f"{safe_html(state['description'])}\n\n"
+            f"⏰ Итоги: <b>{_raffle_date(state['ends_at'])}</b>\n"
+            f"🏅 Победителей: <b>{winners_count}</b>\n\n"
+            "Чтобы участвовать, открой бота PlayFunpay → «🎁 Розыгрыш»."
+        )
+        published = False
+        try:
+            await bot.send_message(state["channel_id"], truncate(announcement))
+            published = True
+        except Exception:
+            logger.exception("Raffle saved, but channel announcement failed")
+        await message.answer(
+            f"✅ <b>Розыгрыш #{rid} создан!</b>\n\n"
+            f"Название: {safe_html(state['title'])}\nПриз: {safe_html(state['prize'])}\n"
+            f"Окончание: {_raffle_date(state['ends_at'])}\n"
+            f"Публикация в канале: {'✅ отправлена' if published else '⚠️ не отправлена'}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [button("⚙️ Открыть розыгрыш", f"admin:raffle:view:{rid}")],
+                [button("🎁 Все розыгрыши", "admin:raffles")],
+                [button("⬅️ В админку", "admin:home")]
+            ])
+        )
+        return True
+    return False
+
+
+# --------------------- Copy messages to users / channel ----------------------
+
+async def process_admin_content_message(message: Message, state: dict[str, Any]) -> None:
+    admin_id = message.from_user.id
+    kind = state.get("state")
+
+    if kind == "admin_channel_message":
+        target = (await get_setting("channel_chat_id", "")).strip()
+        if not target:
+            await message.answer(
+                "Сначала укажи ID/@username канала в админке → Настройки → "
+                "ID канала для публикаций. Состояние не сброшено."
+            )
+            return
+        try:
+            await bot.copy_message(
+                chat_id=target, from_chat_id=message.chat.id, message_id=message.message_id
+            )
+        except Exception:
+            logger.exception("Channel post failed")
+            await message.answer(
+                "Не удалось опубликовать. Проверь ID канала и права бота на публикацию. "
+                "Можешь отправить сообщение ещё раз."
+            )
+            return
+        clear_state(admin_id)
+        await audit(admin_id, "channel_message_published", f"channel={target}")
+        await message.answer("✅ Сообщение опубликовано в канале.", reply_markup=await admin_markup())
+        return
+
+    if kind == "admin_broadcast_message":
+        clear_state(admin_id)
+        users = await db_fetchall("SELECT user_id FROM users WHERE banned=0 ORDER BY user_id")
+        status = await message.answer(f"📢 Начинаю рассылку для {len(users)} пользователей…")
+        success = failed = 0
+        for (target_id,) in users:
+            try:
+                await bot.copy_message(
+                    chat_id=target_id, from_chat_id=message.chat.id, message_id=message.message_id
+                )
+                success += 1
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(float(exc.retry_after) + 1)
+                try:
+                    await bot.copy_message(
+                        chat_id=target_id, from_chat_id=message.chat.id, message_id=message.message_id
+                    )
+                    success += 1
+                except Exception:
+                    failed += 1
+            except (TelegramForbiddenError, TelegramBadRequest, TelegramNetworkError):
+                failed += 1
+            except Exception:
+                failed += 1
+                logger.exception("Broadcast copy failed for %s", target_id)
+            await asyncio.sleep(BROADCAST_DELAY)
+        await audit(admin_id, "rich_broadcast", f"success={success}; failed={failed}; total={len(users)}")
+        await status.edit_text(
+            f"📢 <b>Рассылка завершена</b>\n\n"
+            f"👥 Всего: {len(users)}\n✅ Доставлено: {success}\n❌ Не доставлено: {failed}"
+        )
+
+
+# Keep the original admin input logic intact; intercept only the new states.
+_previous_admin_input_extension = handle_admin_input
+
+async def handle_admin_input(message: Message, state: dict[str, Any], text: str) -> None:
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    if state.get("state", "").startswith("raffle_"):
+        if await _handle_raffle_wizard(message, state, text):
+            return
+    if state.get("state") in {"admin_broadcast_message", "admin_channel_message"}:
+        await process_admin_content_message(message, state)
+        return
+    await _previous_admin_input_extension(message, state, text)
+
+
+@dp.callback_query(F.data == "admin:channel_post")
+async def admin_channel_post(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    target = (await get_setting("channel_chat_id", "")).strip()
+    if not target:
+        await call.message.answer(
+            "Сначала настрой ID канала: админка → Настройки → ID канала для публикаций."
+        )
+        await call.answer()
+        return
+    set_state(call.from_user.id, "admin_channel_message")
+    await call.message.answer(
+        "📣 Отправь сообщение для публикации в канале. Можно текст, фото или документ.\n"
+        "Бот скопирует сообщение без отметки о пересылке. Для отмены — /cancel."
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "admin:raffle_stats")
+async def admin_raffle_stats(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    total = (await db_fetchone("SELECT COUNT(*) FROM raffles"))[0]
+    active = (await db_fetchone("SELECT COUNT(*) FROM raffles WHERE status='active'"))[0]
+    entries = (await db_fetchone("SELECT COUNT(*) FROM raffle_participants"))[0]
+    winners = (await db_fetchone("SELECT COUNT(*) FROM raffle_winners"))[0]
+    await call.message.answer(
+        "🎁 <b>Статистика розыгрышей</b>\n\n"
+        f"Всего: <b>{total}</b>\nАктивных: <b>{active}</b>\n"
+        f"Участий: <b>{entries}</b>\nПобедителей: <b>{winners}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [button("🎁 Управление розыгрышами", "admin:raffles")],
+            [button("⬅️ В админку", "admin:home")]
+        ])
+    )
+    await call.answer()
 
 
 if __name__ == "__main__":
